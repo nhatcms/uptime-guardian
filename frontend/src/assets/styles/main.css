@@ -1,0 +1,28 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  /* Dark theme tokens */
+  --color-bg: #0a0f1e;
+  --color-up: #00d4aa;
+  --color-down: #ff4757;
+}
+
+@layer base {
+  html,
+  body {
+    @apply bg-bg text-slate-100 font-sans antialiased;
+    min-height: 100vh;
+  }
+
+  body {
+    margin: 0;
+  }
+
+  code,
+  pre,
+  .font-mono {
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+  }
+}

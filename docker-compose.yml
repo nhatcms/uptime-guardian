@@ -1,0 +1,41 @@
+# Docker Compose for Uptime Guardian.
+#
+# Brings up the FastAPI backend (port 8000) and the Vue/nginx frontend
+# (port 3000). The SQLite database is stored on the named `sqlite_data`
+# volume so monitor history survives container restarts.
+#
+# Usage:
+#   1. Copy .env.example to .env and fill in your Telegram credentials.
+#   2. docker compose up --build
+
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    # Loads TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, AUTH_SECRET_KEY, etc.
+    env_file:
+      - .env
+    # Point SQLite at the mounted volume (absolute path => four slashes).
+    # This overrides DATABASE_URL from .env so the DB lives on sqlite_data.
+    environment:
+      - DATABASE_URL=sqlite:////data/uptime.db
+    volumes:
+      - sqlite_data:/data
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # Browser-facing URL of the backend. The browser (not the container)
+        # makes these calls, so localhost works for a local deployment.
+        VITE_API_BASE_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  sqlite_data:
