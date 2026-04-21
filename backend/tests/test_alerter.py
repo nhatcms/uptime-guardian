@@ -282,7 +282,7 @@ async def test_property_10_dispatch_never_raises(
     monkeypatch.setattr(alerter.httpx, "AsyncClient", _factory)
 
     # Must complete without raising.
-    await send_telegram_alert("hello")
+    await send_telegram_alert("hello", "123456")
 
 
 @pytest.mark.asyncio
@@ -295,7 +295,7 @@ async def test_dispatch_swallows_config_error(
         raise RuntimeError("no config")
 
     monkeypatch.setattr(alerter, "load_settings", _boom)
-    await send_telegram_alert("hello")
+    await send_telegram_alert("hello", "123456")
 
 
 # ---------------------------------------------------------------------------
@@ -339,7 +339,7 @@ async def test_telegram_request_shape(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(alerter.httpx, "AsyncClient", _RecordingClient)
 
     settings_obj = alerter.load_settings()
-    await send_telegram_alert("the message")
+    await send_telegram_alert("the message", "777111")
 
     assert _RecordingClient.last_url is not None
     assert settings_obj.telegram_bot_token in _RecordingClient.last_url
@@ -347,6 +347,8 @@ async def test_telegram_request_shape(monkeypatch: pytest.MonkeyPatch) -> None:
 
     body = _RecordingClient.last_json
     assert body is not None
-    assert body["chat_id"] == settings_obj.telegram_chat_id
+    # The alert is routed to the explicit per-user chat id (Requirement 9.1),
+    # not the legacy global Settings value.
+    assert body["chat_id"] == "777111"
     assert body["text"] == "the message"
     assert body["parse_mode"] == "HTML"

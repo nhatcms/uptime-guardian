@@ -20,10 +20,10 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from models import CheckResult, Monitor, User
+from models import CheckResult, Monitor, Plan, Transaction, User
 from schemas import MonitorCreate, MonitorUpdate, StatsOut
 
 # The two example monitors seeded on first run (Requirement 10.3).
@@ -31,6 +31,9 @@ _DEFAULT_MONITORS: tuple[tuple[str, str, int], ...] = (
     ("Google", "https://www.google.com", 5),
     ("GitHub", "https://github.com", 5),
 )
+
+# Maximum rows returned by any admin listing (Requirements 17.4, 18.5).
+MAX_LISTING_ROWS: int = 100
 
 
 def _utcnow() -> datetime:
@@ -40,13 +43,15 @@ def _utcnow() -> datetime:
 
 # --- Monitor CRUD ----------------------------------------------------------
 
-def create_monitor(db: Session, data: MonitorCreate) -> Monitor:
-    """Persist a new monitor from a validated ``MonitorCreate`` payload.
+def create_monitor(db: Session, data: MonitorCreate, user_id: int) -> Monitor:
+    """Persist a new monitor owned by ``user_id`` from a validated payload.
 
-    ``is_active`` defaults to true and ``notify_on_failure`` to true via the
-    model column defaults (Requirement 1.1).
+    Every monitor is owned by exactly one Tenant_User via the non-null
+    ``user_id`` foreign key (Requirement 3.1). ``is_active`` defaults to true
+    and ``notify_on_failure`` to true via the model column defaults.
     """
     monitor = Monitor(
+        user_id=user_id,
         name=data.name,
         url=data.url,
         check_interval_minutes=data.check_interval_minutes,
@@ -71,6 +76,79 @@ def get_active_monitors(db: Session) -> list[Monitor]:
     """Return all monitors whose ``is_active`` flag is true."""
     stmt = select(Monitor).where(Monitor.is_active.is_(True)).order_by(Monitor.id)
     return list(db.scalars(stmt).all())
+
+
+# --- Owner-scoped monitor access (tenant isolation) ------------------------
+
+def get_monitors_for_user(db: Session, user_id: int) -> list[Monitor]:
+    """Return only the monitors owned by ``user_id`` (Requirements 4.1, 4.2)."""
+    stmt = (
+        select(Monitor)
+        .where(Monitor.user_id == user_id)
+        .order_by(Monitor.id)
+    )
+    return list(db.scalars(stmt).all())
+
+
+def get_owned_monitor(
+    db: Session, user_id: int, monitor_id: int
+) -> Optional[Monitor]:
+    """Return the monitor iff it exists AND is owned by ``user_id``.
+
+    Returns ``None`` both when the monitor does not exist and when it belongs to
+    a different tenant, so callers raise an identical 404 for the two cases
+    (Requirements 4.3, 4.4, 4.5).
+    """
+    monitor = db.get(Monitor, monitor_id)
+    if monitor is None or monitor.user_id != user_id:
+        return None
+    return monitor
+
+
+def count_monitors_for_user(db: Session, user_id: int) -> int:
+    """Return the number of monitors owned by ``user_id`` (Requirement 5)."""
+    count = db.scalar(
+        select(func.count())
+        .select_from(Monitor)
+        .where(Monitor.user_id == user_id)
+    )
+    return int(count or 0)
+
+
+def update_owned_monitor(
+    db: Session, user_id: int, monitor_id: int, data: MonitorUpdate
+) -> Optional[Monitor]:
+    """Apply updates to a monitor owned by ``user_id``; return it or ``None``.
+
+    Returns ``None`` when the monitor does not exist or is owned by another
+    tenant, leaving that monitor unchanged (Requirement 4.7).
+    """
+    monitor = get_owned_monitor(db, user_id, monitor_id)
+    if monitor is None:
+        return None
+
+    changes = data.model_dump(exclude_unset=True)
+    for field, value in changes.items():
+        setattr(monitor, field, value)
+
+    db.commit()
+    db.refresh(monitor)
+    return monitor
+
+
+def delete_owned_monitor(db: Session, user_id: int, monitor_id: int) -> bool:
+    """Delete a monitor owned by ``user_id``; return ``True`` if deleted.
+
+    Returns ``False`` when the monitor does not exist or is owned by another
+    tenant, leaving it unchanged (Requirement 4.7).
+    """
+    monitor = get_owned_monitor(db, user_id, monitor_id)
+    if monitor is None:
+        return False
+
+    db.delete(monitor)
+    db.commit()
+    return True
 
 
 def update_monitor(
@@ -263,33 +341,210 @@ def create_user(db: Session, username: str, password_hash: str) -> User:
     return user
 
 
+def create_tenant_user(
+    db: Session,
+    *,
+    username: str,
+    email: str,
+    password_hash: str,
+    plan_id: int,
+    is_admin: bool = False,
+) -> User:
+    """Persist a new Tenant_User on the given Plan (Requirements 2.5, 11.5).
+
+    ``plan_expires_at`` is left unset so the user is treated as being on the
+    Free Plan until a paid upgrade completes (Requirement 2.7).
+    """
+    user = User(
+        username=username,
+        email=email,
+        password_hash=password_hash,
+        plan_id=plan_id,
+        is_admin=is_admin,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def get_user_by_email(db: Session, email: str) -> Optional[User]:
+    """Return the user with ``email`` or ``None`` if not found."""
+    stmt = select(User).where(User.email == email)
+    return db.scalars(stmt).first()
+
+
+# --- Plan CRUD -------------------------------------------------------------
+
+def get_plan(db: Session, plan_id: int) -> Optional[Plan]:
+    """Return the plan with ``plan_id`` or ``None`` if it does not exist."""
+    return db.get(Plan, plan_id)
+
+
+def get_plan_by_name_ci(db: Session, name: str) -> Optional[Plan]:
+    """Return the plan whose name matches ``name`` case-insensitively (Req 1.6)."""
+    stmt = select(Plan).where(func.lower(Plan.name) == name.lower())
+    return db.scalars(stmt).first()
+
+
+def get_plans(db: Session) -> list[Plan]:
+    """Return all plans ordered by id (Requirement 17.4)."""
+    return list(db.scalars(select(Plan).order_by(Plan.id)).all())
+
+
+def create_plan(db: Session, data) -> Plan:
+    """Persist a new plan from a validated ``PlanCreate`` (Requirement 17.1)."""
+    plan = Plan(
+        name=data.name,
+        price=data.price,
+        max_monitors=data.max_monitors,
+        ssl_check_enabled=data.ssl_check_enabled,
+        min_interval_minutes=data.min_interval_minutes,
+        duration_days=data.duration_days,
+    )
+    db.add(plan)
+    db.commit()
+    db.refresh(plan)
+    return plan
+
+
+def update_plan(db: Session, plan: Plan, data) -> Plan:
+    """Apply a validated ``PlanUpdate`` to ``plan`` (Requirement 17.3)."""
+    changes = data.model_dump(exclude_unset=True)
+    for field, value in changes.items():
+        setattr(plan, field, value)
+    db.commit()
+    db.refresh(plan)
+    return plan
+
+
+def delete_plan(db: Session, plan: Plan) -> None:
+    """Delete ``plan`` (caller must ensure it has no subscribers; Req 17.5)."""
+    db.delete(plan)
+    db.commit()
+
+
+def count_plan_subscribers(db: Session, plan_id: int) -> int:
+    """Return how many users currently reference ``plan_id`` (Requirement 17.6)."""
+    count = db.scalar(
+        select(func.count())
+        .select_from(User)
+        .where(User.plan_id == plan_id)
+    )
+    return int(count or 0)
+
+
+# --- Transaction CRUD ------------------------------------------------------
+
+def create_transaction(
+    db: Session,
+    *,
+    user_id: int,
+    plan_id: int,
+    amount,  # Decimal
+    reference_code: str,
+    status: str = "pending",
+) -> Transaction:
+    """Persist a new transaction and return it (Requirement 13.1)."""
+    txn = Transaction(
+        user_id=user_id,
+        plan_id=plan_id,
+        amount=amount,
+        reference_code=reference_code,
+        status=status,
+    )
+    db.add(txn)
+    db.commit()
+    db.refresh(txn)
+    return txn
+
+
+def get_transaction_by_reference(
+    db: Session, reference_code: str
+) -> Optional[Transaction]:
+    """Return the transaction with ``reference_code`` or ``None``."""
+    stmt = select(Transaction).where(
+        Transaction.reference_code == reference_code
+    )
+    return db.scalars(stmt).first()
+
+
+def get_pending_transaction(
+    db: Session, user_id: int, plan_id: int
+) -> Optional[Transaction]:
+    """Return an existing pending transaction for the user+plan, or ``None``.
+
+    Supports the single-pending idempotency rule for payment initiation
+    (Requirement 13.5).
+    """
+    stmt = select(Transaction).where(
+        Transaction.user_id == user_id,
+        Transaction.plan_id == plan_id,
+        Transaction.status == "pending",
+    )
+    return db.scalars(stmt).first()
+
+
+def list_transactions(
+    db: Session, limit: int = MAX_LISTING_ROWS
+) -> list[Transaction]:
+    """Return up to ``limit`` transactions, newest first (Requirement 18.5)."""
+    capped = min(limit, MAX_LISTING_ROWS)
+    stmt = (
+        select(Transaction)
+        .order_by(Transaction.created_at.desc(), Transaction.id.desc())
+        .limit(capped)
+    )
+    return list(db.scalars(stmt).all())
+
+
+def list_users(db: Session, limit: int = MAX_LISTING_ROWS) -> list[User]:
+    """Return up to ``limit`` users ordered by id (Requirements 18.1, 18.5)."""
+    capped = min(limit, MAX_LISTING_ROWS)
+    stmt = select(User).order_by(User.id).limit(capped)
+    return list(db.scalars(stmt).all())
+
+
 # --- Seeding helpers (idempotent) ------------------------------------------
 
-def seed_default_monitors(db: Session) -> None:
-    """Insert the two example monitors only if the monitors table is empty.
+def seed_default_monitors(db: Session, user_id: int) -> None:
+    """Insert the two example monitors for ``user_id`` if none exist yet.
 
     Idempotent: repeated invocations after the first leave the table unchanged,
     so the database always contains exactly the Google and GitHub monitors and
-    no duplicates (Requirement 10.3, Property 14).
+    no duplicates (Requirement 10.3, Property 14). The seeded monitors are owned
+    by ``user_id`` so the non-null ownership invariant holds (Requirement 3.1).
     """
     existing = db.scalar(select(Monitor).limit(1))
     if existing is not None:
         return
 
     for name, url, interval in _DEFAULT_MONITORS:
-        db.add(Monitor(name=name, url=url, check_interval_minutes=interval))
+        db.add(
+            Monitor(
+                user_id=user_id,
+                name=name,
+                url=url,
+                check_interval_minutes=interval,
+            )
+        )
     db.commit()
 
 
-def seed_admin_user(db: Session, username: str, password_hash: str) -> None:
-    """Insert the admin user only if the users table is empty.
+def seed_admin_user(db: Session, username: str, password_hash: str) -> User:
+    """Insert the admin user if the users table is empty; return the admin user.
 
-    Idempotent: once a user exists, repeated invocations are no-ops, so exactly
-    one admin user is present with no duplicates (Requirement 10.4, Property 14).
+    Idempotent: once a user exists, the existing first user is returned and no
+    new row is created, so exactly one admin user is present with no duplicates
+    (Requirement 10.4, Property 14). The returned user's id is used to own the
+    seeded default monitors so the ownership invariant holds (Requirement 3.1).
     """
-    existing = db.scalar(select(User).limit(1))
+    existing = db.scalar(select(User).order_by(User.id).limit(1))
     if existing is not None:
-        return
+        return existing
 
-    db.add(User(username=username, password_hash=password_hash))
+    user = User(username=username, password_hash=password_hash, is_admin=True)
+    db.add(user)
     db.commit()
+    db.refresh(user)
+    return user

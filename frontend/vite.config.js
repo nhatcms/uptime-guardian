@@ -13,4 +13,11 @@ export default defineConfig({
   server: {
     port: 5173,
   },
+  // Vitest configuration (Task 12.4): jsdom environment for component tests,
+  // globals so describe/it/expect need no imports.
+  test: {
+    environment: 'jsdom',
+    globals: true,
+    include: ['src/**/*.{test,spec}.{js,ts}', 'tests/**/*.{test,spec}.{js,ts}'],
+  },
 })

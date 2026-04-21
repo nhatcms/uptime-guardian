@@ -19,6 +19,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 DEFAULT_CHECK_INTERVAL_MINUTES: int = 5
 DEFAULT_ALERT_COOLDOWN_MINUTES: int = 10
 
+# External-service timing budgets (Requirements 11.1, 12.1, 13.2).
+# Cloudflare Turnstile server-side verification must complete within 10 seconds;
+# any attempt exceeding this is treated as the service being unavailable (503).
+TURNSTILE_TIMEOUT_SECONDS: float = 10.0
+# SePay QR payment-reference construction is pure string work and must stay well
+# under the 3-second initiation budget; the constant documents that budget.
+QR_GENERATION_BUDGET_SECONDS: float = 3.0
+
 
 class ConfigError(RuntimeError):
     """Raised at startup when a required configuration value is missing."""
@@ -49,6 +57,32 @@ class Settings(BaseSettings):
     # Use "*" to allow any origin (handy for self-hosted LAN access where the
     # dashboard is reached via an IP address rather than localhost).
     cors_allow_origins: str = "http://localhost:5173,http://localhost:3000"
+
+    # --- Cloudflare Turnstile (server-side verification) -------------------
+    # Secret key used to verify Turnstile tokens with Cloudflare. When left
+    # empty (the default), verification runs in dev-only bypass mode where any
+    # non-empty token is accepted; a real secret must be configured in
+    # production (Requirements 11.1, 12.1). Never hardcoded.
+    turnstile_secret_key: str = ""
+    turnstile_verify_url: str = (
+        "https://challenges.cloudflare.com/turnstile/v0/siteverify"
+    )
+
+    # --- SePay payment gateway --------------------------------------------
+    # API key SePay sends on webhook calls via the "Authorization: Apikey <key>"
+    # header; an empty value disables API-key verification (dev only).
+    sepay_api_key: str = ""
+    # Shared secret for the optional HMAC-SHA256 webhook verification mode.
+    sepay_webhook_secret: str = ""
+    # Receiving bank account details encoded into the VietQR payment image.
+    sepay_bank_code: str = ""
+    sepay_account_number: str = ""
+    # Base URL of SePay's dynamic VietQR image endpoint.
+    sepay_qr_base_url: str = "https://qr.sepay.vn/img"
+
+    # --- Plan seeding ------------------------------------------------------
+    # Name of the default free Plan seeded on first run (Requirement 1.8).
+    free_plan_name: str = "Free"
 
     @property
     def cors_origins_list(self) -> list[str]:

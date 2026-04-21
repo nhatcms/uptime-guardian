@@ -32,7 +32,7 @@ from sqlalchemy.pool import StaticPool
 import models  # noqa: F401  (registers ORM models on Base.metadata)
 from auth import create_access_token
 from database import Base, get_db
-from models import CheckResult, Monitor
+from models import CheckResult, Monitor, User
 from routers.monitors import router as monitors_router
 from routers.results import router as results_router
 
@@ -77,6 +77,28 @@ def auth_headers() -> dict[str, str]:
     """Return an Authorization header carrying a genuine bearer token."""
     token = create_access_token("admin")
     return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture(autouse=True)
+def owner_id(factory: sessionmaker[Session]) -> int:
+    """Seed the owning "admin" Tenant_User and return its id.
+
+    Monitors now require a non-null owner (Requirement 3.1), and the create
+    handler resolves the JWT subject ("admin") to a stored user. Autouse so the
+    owner always exists for API requests; tests that insert monitors directly
+    request this fixture to supply ``user_id``.
+    """
+    db = factory()
+    try:
+        user = User(
+            username="admin", password_hash="x-hash", is_admin=True
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        return user.id
+    finally:
+        db.close()
 
 
 @pytest.fixture()
@@ -225,12 +247,13 @@ def test_list_monitors_latest_none_when_no_results(
     client: TestClient,
     auth_headers: dict[str, str],
     factory: sessionmaker[Session],
+    owner_id: int,
 ) -> None:
     """A monitor with no checks reports ``latest`` of None (Requirement 1.3)."""
     # Insert a monitor directly so it has no check results (creating via the
     # API would trigger an immediate check and persist a first result).
     with factory() as db:
-        db.add(Monitor(name="Example", url="https://example.com"))
+        db.add(Monitor(user_id=owner_id, name="Example", url="https://example.com"))
         db.commit()
     response = client.get("/api/monitors/", headers=auth_headers)
     assert response.status_code == 200
@@ -366,10 +389,11 @@ def test_results_list_returns_recent_results(
     client: TestClient,
     auth_headers: dict[str, str],
     factory: sessionmaker[Session],
+    owner_id: int,
 ) -> None:
     """GET /api/results returns the monitor's results (Requirement 8.1)."""
     with factory() as db:
-        monitor = Monitor(name="Example", url="https://example.com")
+        monitor = Monitor(user_id=owner_id, name="Example", url="https://example.com")
         db.add(monitor)
         db.commit()
         monitor_id = monitor.id
@@ -401,10 +425,11 @@ def test_stats_endpoint_computes_window_stats(
     client: TestClient,
     auth_headers: dict[str, str],
     factory: sessionmaker[Session],
+    owner_id: int,
 ) -> None:
     """GET /api/results/stats returns aggregate statistics (Req 8.2, 8.3)."""
     with factory() as db:
-        monitor = Monitor(name="Example", url="https://example.com")
+        monitor = Monitor(user_id=owner_id, name="Example", url="https://example.com")
         db.add(monitor)
         db.commit()
         monitor_id = monitor.id
@@ -440,12 +465,13 @@ def test_stats_empty_window_returns_zeros(
     client: TestClient,
     auth_headers: dict[str, str],
     factory: sessionmaker[Session],
+    owner_id: int,
 ) -> None:
     """An empty window yields all-zero stats without error (Requirement 8.4)."""
     # Insert a monitor directly so it has no check results (creating via the
     # API would trigger an immediate check and persist a first result).
     with factory() as db:
-        monitor = Monitor(name="Example", url="https://example.com")
+        monitor = Monitor(user_id=owner_id, name="Example", url="https://example.com")
         db.add(monitor)
         db.commit()
         monitor_id = monitor.id

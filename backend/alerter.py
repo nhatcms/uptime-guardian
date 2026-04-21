@@ -183,24 +183,32 @@ def _format_utc(moment: datetime) -> str:
     return moment.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-async def send_telegram_alert(message: str) -> None:
-    """POST ``message`` to the Telegram sendMessage endpoint.
+async def send_telegram_alert(message: str, chat_id: Optional[str]) -> None:
+    """POST ``message`` to the Telegram sendMessage endpoint for ``chat_id``.
 
-    Reads the bot token and chat identifier from :class:`Settings`
-    (Requirement 7.2) and sends an HTTP POST with a JSON body containing the
-    chat id, the text, and ``parse_mode`` set to ``HTML`` (Requirement 7.1).
+    The alert is delivered only to the supplied ``chat_id`` — the owning
+    Tenant_User's Telegram chat id — and never to any other tenant (Requirement
+    9.1). When ``chat_id`` is empty, unset, or whitespace, the dispatch is
+    skipped and the reason is logged (Requirement 9.2).
 
-    Any failure (configuration, network, timeout, or malformed response) is
-    logged and swallowed; this function never raises into the caller
-    (Requirements 5.5, 7.3).
+    The bot token is read from :class:`Settings`; the request carries the chat
+    id, the text, and ``parse_mode`` HTML. Any failure (configuration, network,
+    timeout, or non-success response) is logged and swallowed within the
+    10-second timeout so a failed alert never breaks a check cycle (Requirements
+    9.3, 9.4).
     """
+    if chat_id is None or not str(chat_id).strip():
+        logger.info(
+            "Skipping Telegram alert: missing Telegram_Chat_Id for recipient"
+        )
+        return
     try:
         settings = load_settings()
         url = (
             f"{_TELEGRAM_API_BASE}/bot{settings.telegram_bot_token}/sendMessage"
         )
         payload = {
-            "chat_id": settings.telegram_chat_id,
+            "chat_id": chat_id,
             "text": message,
             "parse_mode": "HTML",
         }

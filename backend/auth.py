@@ -147,3 +147,16 @@ def get_current_user(
     if not isinstance(subject, str) or not subject:
         raise credentials_error
     return subject
+
+
+def get_user_by_subject(db: Any, subject: str) -> Any:
+    """Resolve a JWT subject (username) to its stored ``User`` row, or ``None``.
+
+    Token issuance/verification is unchanged; this helper only maps the verified
+    ``sub`` claim to the owning Tenant_User so tenant isolation can key off the
+    user's id (Requirements 2.4, 11.5). ``crud`` is imported lazily to avoid
+    import-order coupling.
+    """
+    from crud import get_user_by_username
+
+    return get_user_by_username(db, subject)

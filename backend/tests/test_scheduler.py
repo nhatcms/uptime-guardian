@@ -27,7 +27,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 import database
 from database import Base
-from models import Monitor
+from models import Monitor, User
 from scheduler import MonitorScheduler
 
 
@@ -66,7 +66,20 @@ def _add_monitor(
     """Insert a monitor via the factory and return its id."""
     db = factory()
     try:
+        # Ensure an owning Tenant_User exists; monitors require a non-null
+        # owner (Requirement 3.1). A single shared owner is reused.
+        owner = db.query(User).first()
+        if owner is None:
+            owner = User(
+                username="owner",
+                password_hash="x-hash",
+                telegram_chat_id="123456",
+            )
+            db.add(owner)
+            db.commit()
+            db.refresh(owner)
         monitor = Monitor(
+            user_id=owner.id,
             name=name,
             url=url,
             is_active=is_active,
@@ -255,7 +268,7 @@ async def test_run_check_dispatches_down_alert_on_transition(
 
     sent: list[str] = []
 
-    async def fake_send(message: str) -> None:
+    async def fake_send(message: str, chat_id: str) -> None:
         sent.append(message)
 
     async def fake_check(monitor: Monitor) -> object:

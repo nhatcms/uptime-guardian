@@ -47,14 +47,37 @@ def _make_engine(database_url: str) -> Engine:
     if database_url.startswith("sqlite"):
 
         @event.listens_for(new_engine, "connect")
-        def _enable_sqlite_foreign_keys(
+        def _sqlite_on_connect(
             dbapi_connection: DBAPIConnection,
             connection_record: ConnectionPoolEntry,
         ) -> None:
-            """Enable ON DELETE CASCADE enforcement for each SQLite connection."""
+            """Configure each SQLite connection for the multi-tenant workload.
+
+            - Enable ``ON DELETE CASCADE`` enforcement (Requirement 1.7 / 3.3).
+            - Disable pysqlite's implicit transaction handling so SQLAlchemy
+              controls ``BEGIN``; combined with the ``begin`` listener below
+              this lets us emit ``BEGIN IMMEDIATE`` to serialize the
+              count-then-insert monitor-creation window (Requirement 5.4).
+            - Set a busy timeout so a writer waits for the reserved lock instead
+              of failing immediately with "database is locked".
+            """
+            # Let SQLAlchemy emit BEGIN explicitly (pysqlite "autocommit"-style).
+            dbapi_connection.isolation_level = None
             cursor = dbapi_connection.cursor()
             cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.execute("PRAGMA busy_timeout=5000")
             cursor.close()
+
+        @event.listens_for(new_engine, "begin")
+        def _sqlite_begin_immediate(conn: Any) -> None:
+            """Begin every transaction with an immediate reserved write lock.
+
+            ``BEGIN IMMEDIATE`` acquires the reserved lock at transaction start
+            so two concurrent monitor creations cannot both read ``count ==
+            max - 1`` before either inserts (Requirement 5.4). Writers that find
+            the lock held wait up to the configured busy timeout.
+            """
+            conn.exec_driver_sql("BEGIN IMMEDIATE")
 
     return new_engine
 

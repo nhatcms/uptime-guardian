@@ -7,13 +7,25 @@ import { useAuthStore } from '@/stores/auth'
 // keep each view in its own chunk.
 const routes = [
   {
+    path: '/',
+    name: 'landing',
+    component: () => import('@/views/Landing.vue'),
+    meta: { public: true },
+  },
+  {
     path: '/login',
     name: 'login',
     component: () => import('@/views/Login.vue'),
     meta: { public: true },
   },
   {
-    path: '/',
+    path: '/register',
+    name: 'register',
+    component: () => import('@/views/Register.vue'),
+    meta: { public: true },
+  },
+  {
+    path: '/dashboard',
     name: 'dashboard',
     component: () => import('@/views/Dashboard.vue'),
   },
@@ -23,6 +35,12 @@ const routes = [
     component: () => import('@/views/MonitorDetail.vue'),
     props: true,
   },
+  {
+    path: '/admin',
+    name: 'admin',
+    component: () => import('@/views/Admin.vue'),
+    meta: { admin: true },
+  },
 ]
 
 const router = createRouter({
@@ -30,10 +48,15 @@ const router = createRouter({
   routes,
 })
 
-// Global auth guard: redirect to /login when no Auth_Token is held. Routes
-// flagged `meta.public` (the login view) are always allowed, which prevents a
-// redirect loop. (Requirement 11.8)
-router.beforeEach((to) => {
+// Global navigation guard.
+//
+// - Public routes (landing, login, register) are always allowed (Req 19, 20).
+// - Unauthenticated access to a protected route redirects to login
+//   (Requirements 11.8, 22.6).
+// - An authenticated non-admin reaching an admin route is sent to the
+//   dashboard; the Admin view also renders an access-denied panel as defense
+//   in depth (Requirement 22.5).
+router.beforeEach(async (to) => {
   const auth = useAuthStore()
 
   if (to.meta.public) {
@@ -42,6 +65,16 @@ router.beforeEach((to) => {
 
   if (!auth.isAuthenticated) {
     return { name: 'login' }
+  }
+
+  if (to.meta.admin) {
+    // Ensure the profile (with is_admin) is loaded before deciding.
+    if (!auth.user) {
+      await auth.fetchProfile()
+    }
+    if (!auth.isAdmin) {
+      return { name: 'dashboard' }
+    }
   }
 
   return true

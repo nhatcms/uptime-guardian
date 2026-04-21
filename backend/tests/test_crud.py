@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session
 import database
 import crud
 from database import Base
-from models import CheckResult, Monitor
+from models import CheckResult, Monitor, User
 
 
 def _make_session() -> tuple[Engine, Session]:
@@ -31,6 +31,15 @@ def _make_session() -> tuple[Engine, Session]:
     engine = database._make_engine("sqlite://")
     Base.metadata.create_all(bind=engine)
     return engine, Session(engine)
+
+
+def _make_owner(db: Session, username: str = "owner") -> int:
+    """Create a Tenant_User to own monitors and return its id (Requirement 3.1)."""
+    user = User(username=username, password_hash="x-hash")
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user.id
 
 
 @pytest.fixture()
@@ -60,7 +69,8 @@ def test_property_13_cascade_delete_removes_monitor_and_results(
     """
     engine, db = _make_session()
     try:
-        monitor = Monitor(name="site", url="https://example.com")
+        owner_id = _make_owner(db)
+        monitor = Monitor(user_id=owner_id, name="site", url="https://example.com")
         for i in range(num_results):
             monitor.results.append(CheckResult(is_up=bool(i % 2), status_code=200))
         db.add(monitor)
@@ -117,8 +127,9 @@ def test_property_11_recent_results_respects_limit_and_ordering(
         # test's own offset arithmetic consistent with what is read back.
         base = datetime(2024, 1, 1)
 
-        target = Monitor(name="target", url="https://example.com")
-        other = Monitor(name="other", url="https://other.example.com")
+        owner_id = _make_owner(db)
+        target = Monitor(user_id=owner_id, name="target", url="https://example.com")
+        other = Monitor(user_id=owner_id, name="other", url="https://other.example.com")
         db.add_all([target, other])
         db.commit()
 

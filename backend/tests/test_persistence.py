@@ -19,7 +19,7 @@ import database
 import models
 from database import Base
 from schemas import MonitorCreate, MonitorOut, MonitorWithLatest
-from models import CheckResult, Monitor
+from models import CheckResult, Monitor, User
 
 
 # --- Schema URL validation -------------------------------------------------
@@ -67,6 +67,7 @@ def test_monitor_out_serializes_from_orm_object() -> None:
     """MonitorOut serializes directly from an ORM Monitor (from_attributes)."""
     monitor = Monitor(
         id=1,
+        user_id=1,
         name="Google",
         url="https://www.google.com",
         is_active=True,
@@ -110,7 +111,10 @@ def test_models_register_relationship_and_cascade() -> None:
     Base.metadata.create_all(bind=test_engine)
 
     with Session(test_engine) as session:
-        monitor = Monitor(name="GitHub", url="https://github.com")
+        owner = User(username="owner", password_hash="x-hash")
+        session.add(owner)
+        session.commit()
+        monitor = Monitor(user_id=owner.id, name="GitHub", url="https://github.com")
         monitor.results.append(CheckResult(is_up=True, status_code=200))
         session.add(monitor)
         session.commit()

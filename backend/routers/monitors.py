@@ -1,30 +1,18 @@
-"""Monitor management router for Uptime Guardian.
+"""Monitor management router (multi-tenant SaaS).
 
-Exposes CRUD and an on-demand check endpoint under ``/api/monitors``. Every
-route depends on :func:`get_current_user`, so a request without a valid
-Auth_Token is rejected with HTTP 401 before any handler logic runs
-(Requirements 12.4, 12.5).
+CRUD plus an on-demand check under ``/api/monitors``, scoped to the
+authenticated Tenant_User. Every route resolves the owner via
+:func:`get_current_tenant_user` (401 when unauthenticated). Reads/updates/deletes
+are restricted to monitors the user owns, returning an identical 404 for
+cross-tenant and nonexistent monitors (Requirements 4.4, 4.5, 4.7). Creation
+sets the owner from the authenticated user (Requirement 3.2) and enforces the
+active plan's monitor-count limit and interval floor (Requirements 5, 6).
 
-Endpoints:
+Plan-limit / interval / no-plan failures map to 403; an invalid interval value
+maps to 400; cross-tenant / missing map to 404.
 
-- ``GET /`` lists all monitors, each with its latest check result embedded
-  (Requirement 1.3).
-- ``POST /`` creates a monitor and returns 201; an invalid URL surfaces as 422
-  via the ``MonitorCreate`` schema validation (Requirements 1.1, 1.2); a
-  persistence failure surfaces as 500 (Requirement 1.3 / error handling).
-- ``GET /{id}`` returns a monitor with its latest result embedded, or 404 when
-  the monitor does not exist (Requirements 1.4, 1.5).
-- ``PUT /{id}`` applies updates and returns the updated monitor, or 404
-  (Requirement 1.6).
-- ``DELETE /{id}`` deletes the monitor and its results, returning 204, or 404
-  (Requirement 1.7).
-- ``POST /{id}/check-now`` triggers an immediate check, persists the result,
-  and returns it, or 404 (Requirement 4.5).
-
-``crud`` is imported lazily inside each handler so this module does not couple
-to ``crud`` at import time, matching the auth router convention.
-
-Requirements traceability: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 4.5, 12.4, 12.5.
+Feature: saas-multi-tenant.
+Requirements traceability: 3.2, 4.1-4.5, 4.7, 5.1-5.3, 6.1-6.6, 12.4.
 """
 
 from __future__ import annotations
@@ -32,10 +20,17 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy.orm import Session
 
-from auth import get_current_user
 from checker import check_monitor
 from database import get_db
-from models import Monitor
+from models import Monitor, User
+from plans import (
+    IntervalTooLowError,
+    InvalidIntervalError,
+    NoActivePlanError,
+    PlanLimitError,
+    enforce_can_create_monitor,
+    enforce_interval_for_update,
+)
 from schemas import (
     CheckResultOut,
     MonitorCreate,
@@ -43,6 +38,7 @@ from schemas import (
     MonitorUpdate,
     MonitorWithLatest,
 )
+from tenancy import get_current_tenant_user, get_owned_monitor_or_404
 
 # Number of most recent check results embedded in the single-monitor detail
 # response (Requirement 1.4 / design endpoint table).
@@ -50,29 +46,16 @@ _DETAIL_RESULT_LIMIT: int = 50
 
 
 class MonitorDetail(MonitorWithLatest):
-    """A monitor with its latest result and its 50 most recent results.
-
-    Returned by ``GET /{id}`` so the detail view receives the monitor, the
-    embedded latest result, and the recent check history in a single response
-    (Requirement 1.4, design endpoint table "Monitor + last 50 results").
-    """
+    """A monitor with its latest result and its 50 most recent results."""
 
     results: list[CheckResultOut] = []
 
-router = APIRouter(
-    prefix="/api/monitors",
-    tags=["monitors"],
-    dependencies=[Depends(get_current_user)],
-)
+
+router = APIRouter(prefix="/api/monitors", tags=["monitors"])
 
 
 def _to_with_latest(db: Session, monitor: Monitor) -> MonitorWithLatest:
-    """Serialize ``monitor`` as a :class:`MonitorWithLatest` with its latest result.
-
-    Reads the most recent check result for the monitor (or ``None`` when the
-    monitor has never been checked) and embeds it in the response model
-    (Requirements 1.3, 1.4).
-    """
+    """Serialize ``monitor`` as a :class:`MonitorWithLatest` with its latest result."""
     import crud  # lazy import to avoid import-order coupling
 
     payload = MonitorWithLatest.model_validate(monitor)
@@ -84,14 +67,17 @@ def _to_with_latest(db: Session, monitor: Monitor) -> MonitorWithLatest:
 
 
 @router.get("/", response_model=list[MonitorWithLatest])
-def list_monitors(db: Session = Depends(get_db)) -> list[MonitorWithLatest]:
-    """Return all monitors, each with its latest check result embedded.
+def list_monitors(
+    user: User = Depends(get_current_tenant_user),
+    db: Session = Depends(get_db),
+) -> list[MonitorWithLatest]:
+    """Return the authenticated user's monitors, each with its latest result.
 
-    Validates: Requirements 1.3
+    Validates: Requirements 4.1, 4.2
     """
     import crud  # lazy import to avoid import-order coupling
 
-    monitors = crud.get_monitors(db)
+    monitors = crud.get_monitors_for_user(db, user.id)
     return [_to_with_latest(db, monitor) for monitor in monitors]
 
 
@@ -100,28 +86,45 @@ def list_monitors(db: Session = Depends(get_db)) -> list[MonitorWithLatest]:
 )
 async def create_monitor(
     payload: MonitorCreate,
+    user: User = Depends(get_current_tenant_user),
     db: Session = Depends(get_db),
 ) -> MonitorWithLatest:
-    """Create a new monitor, check it immediately, and return it with HTTP 201.
+    """Create a monitor owned by the authenticated user (Requirements 3.2, 5, 6).
 
-    The ``MonitorCreate`` schema validates the URL, so a malformed URL is
-    rejected with HTTP 422 before this handler runs (Requirement 1.2). A
-    database error during persistence is caught and surfaced as HTTP 500
-    (Requirement 1.3 error handling).
+    Enforces the active plan's monitor-count limit and interval floor before
+    persisting. The count check and the insert run in the same write-locked
+    transaction so the limit holds under concurrency (Requirement 5.4).
 
-    After persisting the monitor, an immediate check is run and its result is
-    saved so the very first status is reported right away rather than waiting
-    for the first scheduled poll (Requirement 4.5). The monitor is also
-    registered with the scheduler so recurring checks begin without a restart
-    (Requirement 4.3). The created monitor is returned with its latest result
-    embedded.
-
-    Validates: Requirements 1.1, 1.2, 4.3, 4.5
+    Validates: Requirements 3.2, 4.3, 4.5, 5.1, 5.2, 5.3, 6.1, 6.2, 6.6
     """
     import crud  # lazy import to avoid import-order coupling
 
     try:
-        monitor = crud.create_monitor(db, payload)
+        enforce_can_create_monitor(db, user, payload.check_interval_minutes)
+    except InvalidIntervalError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    except PlanLimitError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Monitor limit reached for your plan "
+                f"(maximum {exc.max_monitors})"
+            ),
+        ) from exc
+    except IntervalTooLowError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
+        ) from exc
+    except NoActivePlanError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No active plan is in effect for your account",
+        ) from exc
+
+    try:
+        monitor = crud.create_monitor(db, payload, user.id)
     except Exception as exc:  # persistence failure -> 500
         db.rollback()
         raise HTTPException(
@@ -129,8 +132,7 @@ async def create_monitor(
             detail="Failed to persist monitor",
         ) from exc
 
-    # Run an immediate check so the new monitor reports a result right away
-    # instead of staying "pending" until the first scheduled poll.
+    # Immediate first check so the new monitor reports a status right away.
     try:
         result = await check_monitor(monitor)
         crud.create_check_result(
@@ -146,8 +148,6 @@ async def create_monitor(
     except Exception:  # an initial-check failure must not fail creation
         db.rollback()
 
-    # Register the monitor with the scheduler so recurring checks begin without
-    # requiring an application restart (Requirement 4.3).
     if monitor.is_active:
         try:
             import scheduler
@@ -162,24 +162,16 @@ async def create_monitor(
 @router.get("/{monitor_id}", response_model=MonitorDetail)
 def get_monitor(
     monitor_id: int,
+    user: User = Depends(get_current_tenant_user),
     db: Session = Depends(get_db),
 ) -> MonitorDetail:
-    """Return a single monitor with its 50 most recent results, or 404.
+    """Return one owned monitor with its recent results, or 404.
 
-    Embeds the latest check result and the 50 most recent check results
-    (newest first) for the monitor, or responds with HTTP 404 when no monitor
-    with ``monitor_id`` exists (Requirements 1.4, 1.5).
-
-    Validates: Requirements 1.4, 1.5
+    Validates: Requirements 4.3, 4.4, 4.5
     """
     import crud  # lazy import to avoid import-order coupling
 
-    monitor = crud.get_monitor(db, monitor_id)
-    if monitor is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Monitor not found"
-        )
-
+    monitor = get_owned_monitor_or_404(db, user, monitor_id)
     payload = MonitorDetail.model_validate(monitor)
     latest = crud.get_latest_result(db, monitor.id)
     payload.latest = (
@@ -194,16 +186,40 @@ def get_monitor(
 def update_monitor(
     monitor_id: int,
     payload: MonitorUpdate,
+    user: User = Depends(get_current_tenant_user),
     db: Session = Depends(get_db),
 ) -> MonitorOut:
-    """Apply updates to an existing monitor and return it, or 404 if missing.
+    """Update an owned monitor, enforcing the interval floor, or 404.
 
-    Validates: Requirements 1.6
+    A requested interval below the active plan minimum is rejected with 403 and
+    the stored interval is left unchanged (Requirements 6.3, 6.4).
+
+    Validates: Requirements 4.7, 6.3, 6.4, 6.5, 6.6
     """
     import crud  # lazy import to avoid import-order coupling
 
-    monitor = crud.update_monitor(db, monitor_id, payload)
-    if monitor is None:
+    # Ownership first: cross-tenant / missing is an identical 404.
+    get_owned_monitor_or_404(db, user, monitor_id)
+
+    if payload.check_interval_minutes is not None:
+        try:
+            enforce_interval_for_update(db, user, payload.check_interval_minutes)
+        except InvalidIntervalError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+            ) from exc
+        except IntervalTooLowError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
+            ) from exc
+        except NoActivePlanError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No active plan is in effect for your account",
+            ) from exc
+
+    monitor = crud.update_owned_monitor(db, user.id, monitor_id, payload)
+    if monitor is None:  # pragma: no cover - guarded by the 404 check above
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Monitor not found"
         )
@@ -213,15 +229,16 @@ def update_monitor(
 @router.delete("/{monitor_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_monitor(
     monitor_id: int,
+    user: User = Depends(get_current_tenant_user),
     db: Session = Depends(get_db),
 ) -> Response:
-    """Delete a monitor and all of its results, or 404 if missing.
+    """Delete an owned monitor and its results, or 404.
 
-    Validates: Requirements 1.7
+    Validates: Requirements 4.7
     """
     import crud  # lazy import to avoid import-order coupling
 
-    deleted = crud.delete_monitor(db, monitor_id)
+    deleted = crud.delete_owned_monitor(db, user.id, monitor_id)
     if not deleted:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Monitor not found"
@@ -232,25 +249,16 @@ def delete_monitor(
 @router.post("/{monitor_id}/check-now", response_model=CheckResultOut)
 async def check_now(
     monitor_id: int,
+    user: User = Depends(get_current_tenant_user),
     db: Session = Depends(get_db),
 ) -> CheckResultOut:
-    """Trigger an immediate check for a monitor and persist the result.
+    """Trigger an immediate check for an owned monitor and persist the result.
 
-    Returns the persisted :class:`CheckResultOut`, or HTTP 404 when the monitor
-    does not exist. The check itself is performed by :func:`check_monitor`
-    (which never raises for transport failures) and the resulting unsaved
-    record is persisted via ``crud.create_check_result`` (Requirement 4.5).
-
-    Validates: Requirements 4.5
+    Validates: Requirements 4.4, 4.5
     """
     import crud  # lazy import to avoid import-order coupling
 
-    monitor = crud.get_monitor(db, monitor_id)
-    if monitor is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Monitor not found"
-        )
-
+    monitor = get_owned_monitor_or_404(db, user, monitor_id)
     result = await check_monitor(monitor)
     saved = crud.create_check_result(
         db,

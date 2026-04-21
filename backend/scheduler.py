@@ -45,14 +45,19 @@ from alerter import (
     send_telegram_alert,
 )
 from checker import check_monitor
-from config import load_settings
 from database import SessionLocal
-from models import Monitor
+from models import Monitor, User
+from plans import resolve_active_plan
 
 logger = logging.getLogger(__name__)
 
 # Factory that produces a new SQLAlchemy session when called.
 SessionFactory = Callable[[], Session]
+
+# Job id of the periodic plan-reconciliation job (Requirement 8.5).
+_RECONCILE_JOB_ID = "reconcile-plans"
+# Reconcile interval: well under the 60-second bound of Requirement 8.5.
+_RECONCILE_INTERVAL_SECONDS = 30
 
 
 @dataclass
@@ -93,9 +98,17 @@ class MonitorScheduler:
         """Register a job for every active monitor and start the scheduler.
 
         Loads all active monitors and registers one recurring interval job per
-        monitor before starting the underlying scheduler (Requirement 4.1).
+        monitor, then adds the periodic plan-reconciliation job, before
+        starting the underlying scheduler (Requirements 4.1, 8.5).
         """
         self._register_all_active_monitors()
+        self._scheduler.add_job(
+            self.reconcile,
+            trigger="interval",
+            seconds=_RECONCILE_INTERVAL_SECONDS,
+            id=_RECONCILE_JOB_ID,
+            replace_existing=True,
+        )
         if not self._scheduler.running:
             self._scheduler.start()
 
@@ -116,42 +129,147 @@ class MonitorScheduler:
 
     # --- Job registration --------------------------------------------------
 
-    def register_monitor(self, monitor: Monitor) -> Job:
+    def register_monitor(self, monitor: Monitor) -> Optional[Job]:
         """Schedule a recurring interval job for ``monitor``.
 
-        The job fires every ``monitor.check_interval_minutes`` minutes and runs
-        :meth:`run_check` for the monitor's id. Re-registering an existing
-        monitor replaces its job, so a monitor added or updated through the API
-        is scheduled without a restart (Requirement 4.3).
+        The effective interval is the greater of the monitor's configured
+        interval and the owner's active-plan Min_Interval_Minutes (Requirement
+        8.1). When the owner has no resolvable active plan the monitor is
+        skipped and the reason is logged (Requirement 8.2). Re-registering an
+        existing monitor replaces its job so API changes take effect without a
+        restart (Requirement 4.3).
         """
+        db = self._session_factory()
+        try:
+            interval = self._effective_interval(db, monitor)
+        finally:
+            db.close()
+        if interval is None:
+            logger.info(
+                "Skipping scheduler registration for monitor %s: "
+                "no active plan for owner",
+                monitor.id,
+            )
+            return None
+        return self._schedule_job(monitor.id, interval)
+
+    def _schedule_job(self, monitor_id: int, minutes: int) -> Job:
+        """Add/replace the interval job for ``monitor_id`` at ``minutes``."""
         return self._scheduler.add_job(
             self.run_check,
             trigger="interval",
-            minutes=monitor.check_interval_minutes,
-            args=[monitor.id],
-            id=_job_id(monitor.id),
+            minutes=minutes,
+            args=[monitor_id],
+            id=_job_id(monitor_id),
             replace_existing=True,
         )
 
+    def _effective_interval(
+        self, db: Session, monitor: Monitor
+    ) -> Optional[int]:
+        """Return the effective polling interval, or ``None`` to skip.
+
+        Effective interval = max(configured interval, owner active-plan
+        Min_Interval_Minutes) (Requirement 8.1). Returns ``None`` when the
+        owner or an active plan cannot be resolved (Requirement 8.2).
+        """
+        owner = db.get(User, monitor.user_id)
+        if owner is None:
+            return None
+        try:
+            plan = resolve_active_plan(db, owner)
+        except Exception:  # pragma: no cover - corrupt-DB defensive path
+            return None
+        return max(monitor.check_interval_minutes, plan.min_interval_minutes)
+
     def reload_scheduler(self) -> None:
-        """Clear all jobs and re-register every active monitor.
+        """Clear all monitor jobs and re-register every active monitor.
 
         Used after monitor configuration changes to bring the scheduled jobs
-        back in sync with the database (Requirement 4.3).
+        back in sync with the database (Requirement 4.3). The reconcile job, if
+        present, is preserved.
         """
-        self._scheduler.remove_all_jobs()
+        for job in self._scheduler.get_jobs():
+            if job.id != _RECONCILE_JOB_ID:
+                job.remove()
         self._register_all_active_monitors()
 
+    def reconcile(self) -> None:
+        """Re-evaluate effective intervals and job membership (Requirement 8.5).
+
+        Recomputes each active monitor's effective interval from its owner's
+        current active plan and re-registers any job whose interval changed;
+        registers newly active monitors and removes jobs for monitors that are
+        no longer active or have been deleted. Converges well within the 60-
+        second bound without a restart.
+        """
+        db = self._session_factory()
+        try:
+            active = {m.id: m for m in crud.get_active_monitors(db)}
+            existing = {
+                job.id: job
+                for job in self._scheduler.get_jobs()
+                if job.id.startswith("monitor-")
+            }
+            # Remove jobs for monitors no longer active/present.
+            for job_id, job in existing.items():
+                monitor_id = int(job_id.removeprefix("monitor-"))
+                if monitor_id not in active:
+                    job.remove()
+            # Add/update jobs for active monitors with the current interval.
+            for monitor in active.values():
+                interval = self._effective_interval(db, monitor)
+                if interval is None:
+                    logger.info(
+                        "Reconcile skipped monitor %s: no active plan",
+                        monitor.id,
+                    )
+                    continue
+                job = existing.get(_job_id(monitor.id))
+                current = (
+                    getattr(job.trigger, "interval", None) if job else None
+                )
+                # Re-register when new or when the interval changed.
+                if job is None or (
+                    current is not None
+                    and current.total_seconds() != interval * 60
+                ):
+                    self._schedule_job(monitor.id, interval)
+        except Exception:  # noqa: BLE001 - reconcile must never crash the loop
+            logger.exception("Plan reconciliation pass failed")
+        finally:
+            db.close()
+
     def get_jobs(self) -> List[Job]:
-        """Return the list of currently scheduled jobs."""
-        return list(self._scheduler.get_jobs())
+        """Return the list of currently scheduled monitor jobs.
+
+        Excludes the internal plan-reconciliation job so callers and tests see
+        only per-monitor jobs.
+        """
+        return [
+            job
+            for job in self._scheduler.get_jobs()
+            if job.id.startswith("monitor-")
+        ]
 
     def _register_all_active_monitors(self) -> None:
-        """Register one job per active monitor read from the database."""
+        """Register one job per active monitor read from the database.
+
+        Skips monitors whose owner has no resolvable active plan (Requirement
+        8.2), logging the reason.
+        """
         db = self._session_factory()
         try:
             for monitor in crud.get_active_monitors(db):
-                self.register_monitor(monitor)
+                interval = self._effective_interval(db, monitor)
+                if interval is None:
+                    logger.info(
+                        "Skipping scheduler registration for monitor %s: "
+                        "no active plan for owner",
+                        monitor.id,
+                    )
+                    continue
+                self._schedule_job(monitor.id, interval)
         finally:
             db.close()
 
@@ -179,8 +297,25 @@ class MonitorScheduler:
                 # so up -> down transitions can be detected (Requirement 5.1).
                 previous_result = crud.get_latest_result(db, monitor_id)
 
+                # Resolve the owner and active plan for SSL gating + routing.
+                owner = db.get(User, monitor.user_id)
+                active_plan = None
+                if owner is not None:
+                    try:
+                        active_plan = resolve_active_plan(db, owner)
+                    except Exception:  # pragma: no cover - defensive
+                        active_plan = None
+
                 # Perform the actual HTTP/SSL check (async, non-blocking).
                 check = await check_monitor(monitor)
+
+                # SSL feature gating (Requirement 7.1): when the owner's active
+                # plan disables SSL checking, record SSL fields as empty for
+                # this (and subsequent) results; previously stored results are
+                # left untouched (Requirement 7.2).
+                if active_plan is not None and not active_plan.ssl_check_enabled:
+                    check.ssl_valid = None
+                    check.ssl_days_remaining = None
 
                 # Persist the result (Requirement 4.2).
                 saved = crud.create_check_result(
@@ -194,7 +329,12 @@ class MonitorScheduler:
                     error_message=check.error_message,
                 )
 
-                await self._apply_alerts(monitor, previous_result, saved)
+                owner_chat_id = (
+                    owner.telegram_chat_id if owner is not None else None
+                )
+                await self._apply_alerts(
+                    monitor, previous_result, saved, owner_chat_id
+                )
             finally:
                 db.close()
         except Exception:  # noqa: BLE001 - one bad job must not break others
@@ -207,14 +347,19 @@ class MonitorScheduler:
         monitor: Monitor,
         previous_result: object,
         saved_result: object,
+        chat_id: Optional[str],
     ) -> None:
         """Apply alert decisions for a freshly saved result and dispatch alerts.
 
         Uses per-monitor in-memory alert state and the configured cooldown to
-        decide whether to send a down alert and/or an SSL warning, updating the
-        stored timestamps whenever an alert fires (Requirements 5.1, 6.1).
+        decide whether to send a down alert and/or an SSL warning, then routes
+        each alert to the owning Tenant_User's ``chat_id`` (Requirement 9.1).
+        The alerter skips dispatch when ``chat_id`` is empty (Requirement 9.2).
+        SSL warnings are implicitly suppressed when SSL is plan-disabled because
+        the SSL fields were blanked before persistence (Requirement 7.5). The
+        down-alert cooldown equals the monitor's configured interval in minutes
+        (Requirement 24.3).
         """
-        settings = load_settings()
         now = datetime.now(timezone.utc)
         state = self._alert_state.setdefault(monitor.id, _AlertState())
 
@@ -225,14 +370,18 @@ class MonitorScheduler:
             last_down_alert_at=state.last_down_alert_at,
             last_ssl_alert_at=state.last_ssl_alert_at,
             now=now,
-            cooldown_minutes=settings.alert_cooldown_minutes,
+            cooldown_minutes=monitor.check_interval_minutes,
         )
 
         if send_down:
-            await send_telegram_alert(build_down_message(monitor, saved_result))
+            await send_telegram_alert(
+                build_down_message(monitor, saved_result), chat_id
+            )
             state.last_down_alert_at = now
         if send_ssl:
-            await send_telegram_alert(build_ssl_message(monitor, saved_result))
+            await send_telegram_alert(
+                build_ssl_message(monitor, saved_result), chat_id
+            )
             state.last_ssl_alert_at = now
 
 

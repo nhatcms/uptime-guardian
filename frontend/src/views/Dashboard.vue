@@ -1,10 +1,12 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
 
 import api from '@/api'
 import AddMonitorModal from '@/components/AddMonitorModal.vue'
 import EditMonitorModal from '@/components/EditMonitorModal.vue'
 import MonitorCard from '@/components/MonitorCard.vue'
+import SettingsPanel from '@/components/SettingsPanel.vue'
 import { useAuthStore } from '@/stores/auth'
 import { useMonitorsStore } from '@/stores/monitors'
 
@@ -51,6 +53,11 @@ const SKELETON_COUNT = 6
 
 const monitorsStore = useMonitorsStore()
 const auth = useAuthStore()
+const router = useRouter()
+
+// Toggles the inline settings/plan panel (Requirement 21).
+const showSettings = ref(false)
+const isAdmin = computed(() => auth.isAdmin)
 
 // Global 24h uptime as a percentage (0–100), or null when it cannot be
 // computed (no checks in the window yet).
@@ -177,13 +184,15 @@ function onMonitorCreated() {
   computeGlobalUptime()
 }
 
-/** Log out and let the router guard redirect to the login view. */
+/** Log out and redirect to the login view. */
 function logout() {
   auth.logout()
+  router.push({ name: 'login' })
 }
 
 onMounted(() => {
-  // Initial load, then start 30s polling (Requirement 11.3).
+  // Ensure the admin link/guard has the profile, then load data + poll.
+  auth.fetchProfile()
   refresh()
   pollHandle = setInterval(refresh, POLL_INTERVAL_MS)
 })
@@ -225,6 +234,24 @@ onUnmounted(() => {
             </p>
           </div>
 
+          <!-- Admin console link (only for admins) -->
+          <router-link
+            v-if="isAdmin"
+            :to="{ name: 'admin' }"
+            class="rounded-lg border border-slate-700 px-3 py-2 text-sm font-medium text-slate-300 transition hover:bg-slate-800"
+          >
+            Admin
+          </router-link>
+
+          <!-- Settings toggle -->
+          <button
+            type="button"
+            class="rounded-lg border border-slate-700 px-3 py-2 text-sm font-medium text-slate-300 transition hover:bg-slate-800"
+            @click="showSettings = !showSettings"
+          >
+            {{ showSettings ? 'Hide settings' : 'Settings' }}
+          </button>
+
           <!-- Logout -->
           <button
             type="button"
@@ -238,6 +265,11 @@ onUnmounted(() => {
     </header>
 
     <main class="mx-auto max-w-6xl px-4 py-6 sm:px-6">
+      <!-- Settings / plan panel (Requirement 21) -->
+      <div v-if="showSettings" class="mb-6">
+        <SettingsPanel />
+      </div>
+
       <!-- Error banner: shown while preserving the last loaded data -->
       <p
         v-if="error"

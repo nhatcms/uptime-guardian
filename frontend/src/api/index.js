@@ -110,3 +110,42 @@ api.interceptors.response.use(
 )
 
 export default api
+
+// ---------------------------------------------------------------------------
+// Method groups for the multi-tenant SaaS API (Tasks 12.1).
+//
+// Each group reuses the shared `api` instance (Bearer interceptor + 401
+// handling + error toasts). Paths are relative to the `/api` baseURL. Public
+// endpoints (plans listing) work without a token; the rest require auth.
+// ---------------------------------------------------------------------------
+
+/** Public pricing/plans (no auth) — used by the landing page (Req 19.1). */
+export const plansApi = {
+  /** GET /api/plans → list of active plans (empty list if none). */
+  list: () => api.get('/plans'),
+}
+
+/** Authenticated dashboard settings (Req 10, 21). */
+export const settingsApi = {
+  /** GET /api/settings → telegram id, active plan limits, usage, profile. */
+  get: () => api.get('/settings'),
+  /** PUT /api/settings/telegram → set/clear the Telegram chat id. */
+  setTelegram: (telegramChatId) =>
+    api.put('/settings/telegram', { telegram_chat_id: telegramChatId }),
+}
+
+/** SePay payments (Req 13, 21.5). */
+export const paymentsApi = {
+  /** POST /api/payments/initiate → pending tx + QR reference for a plan. */
+  initiate: (planId) => api.post('/payments/initiate', { plan_id: planId }),
+}
+
+/** Administrative console operations (Req 17, 18). */
+export const adminApi = {
+  listPlans: () => api.get('/admin/plans'),
+  createPlan: (payload) => api.post('/admin/plans', payload),
+  updatePlan: (id, payload) => api.put(`/admin/plans/${id}`, payload),
+  deletePlan: (id) => api.delete(`/admin/plans/${id}`),
+  listUsers: () => api.get('/admin/users'),
+  listTransactions: () => api.get('/admin/transactions'),
+}

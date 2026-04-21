@@ -159,7 +159,13 @@ def test_property_17_invalid_credentials_are_rejected(
 
     response = client.post(
         "/api/auth/login",
-        json={"username": username, "password": password},
+        json={
+            "username": username,
+            "password": password,
+            # Non-empty token + empty secret (test env) -> Turnstile dev bypass,
+            # so this test isolates the credential-validation behavior.
+            "turnstile_token": "dev-token",
+        },
     )
 
     if username == stored_username and password == stored_password:

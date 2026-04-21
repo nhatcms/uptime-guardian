@@ -23,17 +23,21 @@ import logging
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Final
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 import crud
 import scheduler
 from auth import hash_password
 from config import load_settings
-from database import SessionLocal, init_db
+from database import SessionLocal, get_db, init_db
+from routers.admin import router as admin_router
 from routers.auth import router as auth_router
 from routers.monitors import router as monitors_router
+from routers.payments import router as payments_router
 from routers.results import router as results_router
+from routers.settings import router as settings_router
+from schemas import PlanOut
 
 logger = logging.getLogger(__name__)
 
@@ -54,12 +58,36 @@ def _seed_initial_data() -> None:
     """
     db = SessionLocal()
     try:
-        crud.seed_default_monitors(db)
-        crud.seed_admin_user(
+        admin = crud.seed_admin_user(
             db,
             _DEFAULT_ADMIN_USERNAME,
             hash_password(_DEFAULT_ADMIN_PASSWORD),
         )
+        # Seed the example monitors owned by the admin user so every monitor
+        # has an owner (Requirement 3.1). Ordering matters: the admin must
+        # exist before its monitors are created.
+        crud.seed_default_monitors(db, admin.id)
+    finally:
+        db.close()
+
+
+def _run_migration() -> None:
+    """Run the idempotent single-user -> multi-tenant migration at startup.
+
+    Reads the legacy global Telegram chat id from ``Settings.telegram_chat_id``
+    and logs the resulting :class:`MigrationOutcome` (Requirements 23.5, 23.7).
+    """
+    import migration
+
+    settings = load_settings()
+    db = SessionLocal()
+    try:
+        result = migration.migrate(
+            db, global_telegram_chat_id=settings.telegram_chat_id
+        )
+        logger.info("Data migration outcome: %s", result.outcome.value)
+        if result.error:
+            logger.error("Data migration error: %s", result.error)
     finally:
         db.close()
 
@@ -75,6 +103,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Create the schema. If this raises, the exception propagates and startup
     # halts so the app never serves on a broken schema (Requirements 10.1, 10.2).
     init_db()
+
+    # Promote any legacy single-user database to the multi-tenant model
+    # (Requirement 23). Idempotent: a no-op on already-migrated or fresh DBs.
+    _run_migration()
 
     # Seed example monitors and the admin user (idempotent; Requirements 10.3, 10.4).
     _seed_initial_data()
@@ -119,11 +151,21 @@ def create_app() -> FastAPI:
             allow_headers=["*"],
         )
 
-    # Routers already carry their own /api/auth, /api/monitors, /api/results
-    # prefixes (Requirements 1.1, 8.1, 12.1).
+    # Routers already carry their own /api/... prefixes.
     app.include_router(auth_router)
     app.include_router(monitors_router)
     app.include_router(results_router)
+    app.include_router(settings_router)
+    app.include_router(payments_router)
+    app.include_router(admin_router)
+
+    @app.get("/api/plans", response_model=list[PlanOut], tags=["plans"])
+    def list_public_plans(db=Depends(get_db)) -> list[PlanOut]:
+        """Public pricing endpoint for the landing page (Requirement 19.1).
+
+        Returns all plans (empty list if none); requires no authentication.
+        """
+        return [PlanOut.model_validate(p) for p in crud.get_plans(db)]
 
     return app
 

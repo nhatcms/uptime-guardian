@@ -65,11 +65,13 @@ def test_seeding_is_idempotent(repeats: int) -> None:
         for _ in range(repeats):
             db = factory()
             try:
-                crud.seed_default_monitors(db)
                 # A fixed pre-hashed value stands in for the bcrypt hash; the
                 # seeding helper does not interpret it, so this keeps the
-                # property test fast and deterministic.
-                crud.seed_admin_user(db, "admin", "hashed-admin-password")
+                # property test fast and deterministic. The admin must be
+                # seeded first so the example monitors can be owned by it
+                # (Requirement 3.1).
+                admin = crud.seed_admin_user(db, "admin", "hashed-admin-password")
+                crud.seed_default_monitors(db, admin.id)
             finally:
                 db.close()
 
@@ -149,6 +151,7 @@ def test_lifecycle_starts_and_stops_scheduler(monkeypatch: pytest.MonkeyPatch) -
     events: list[str] = []
 
     monkeypatch.setattr(main, "init_db", lambda: events.append("init_db"))
+    monkeypatch.setattr(main, "_run_migration", lambda: events.append("migrate"))
     monkeypatch.setattr(main, "_seed_initial_data", lambda: events.append("seed"))
     monkeypatch.setattr(main.scheduler, "start", lambda: events.append("start"))
     monkeypatch.setattr(main.scheduler, "shutdown", lambda: events.append("shutdown"))
@@ -159,5 +162,6 @@ def test_lifecycle_starts_and_stops_scheduler(monkeypatch: pytest.MonkeyPatch) -
 
     asyncio.run(drive())
 
-    # init_db and seeding happen before the scheduler starts; shutdown runs last.
-    assert events == ["init_db", "seed", "start", "serving", "shutdown"]
+    # init_db, migration, and seeding happen before the scheduler starts;
+    # shutdown runs last.
+    assert events == ["init_db", "migrate", "seed", "start", "serving", "shutdown"]
