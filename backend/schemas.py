@@ -285,6 +285,8 @@ class DashboardSettingsOut(BaseModel):
     username: str
     email: Optional[str] = None
     is_admin: bool = False
+    avatar_url: Optional[str] = None
+    email_verified: bool = False
     telegram_chat_id: Optional[str] = None
     plan: ActivePlanOut
     monitors_used: int

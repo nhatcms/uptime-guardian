@@ -3,7 +3,7 @@ import { ref } from 'vue'
 import { useRouter } from 'vue-router'
 
 import TurnstileWidget from '@/components/TurnstileWidget.vue'
-import { extractErrorMessage } from '@/api'
+import { extractErrorMessage, GOOGLE_LOGIN_URL } from '@/api'
 import { useAuthStore } from '@/stores/auth'
 
 // Login view with the Turnstile bot challenge (Requirements 12, 20).
@@ -56,6 +56,13 @@ async function handleSubmit() {
   } finally {
     loading.value = false
   }
+}
+
+// Begin the Google OAuth flow by handing the browser off to the backend, which
+// redirects to Google's consent screen. A full navigation (not an XHR) is
+// required so the browser follows the OAuth redirects.
+function signInWithGoogle() {
+  window.location.href = GOOGLE_LOGIN_URL
 }
 </script>
 
@@ -133,6 +140,39 @@ async function handleSubmit() {
           class="w-full rounded-lg bg-up px-4 py-2 font-medium text-bg transition hover:bg-up/90 disabled:cursor-not-allowed disabled:opacity-60"
         >
           {{ loading ? 'Signing in…' : 'Sign in' }}
+        </button>
+
+        <div class="flex items-center gap-3">
+          <span class="h-px flex-1 bg-slate-800"></span>
+          <span class="text-xs uppercase tracking-wide text-slate-500">or</span>
+          <span class="h-px flex-1 bg-slate-800"></span>
+        </div>
+
+        <button
+          type="button"
+          :disabled="loading"
+          class="flex w-full items-center justify-center gap-2.5 rounded-lg border border-slate-700 bg-slate-950/40 px-4 py-2 font-medium text-slate-200 transition hover:bg-slate-800/60 disabled:cursor-not-allowed disabled:opacity-60"
+          @click="signInWithGoogle"
+        >
+          <svg class="h-5 w-5" viewBox="0 0 24 24" aria-hidden="true">
+            <path
+              fill="#4285F4"
+              d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.27-4.74 3.27-8.1z"
+            />
+            <path
+              fill="#34A853"
+              d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.99.66-2.26 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84A11 11 0 0 0 12 23z"
+            />
+            <path
+              fill="#FBBC05"
+              d="M5.84 14.1a6.6 6.6 0 0 1 0-4.2V7.06H2.18a11 11 0 0 0 0 9.88l3.66-2.84z"
+            />
+            <path
+              fill="#EA4335"
+              d="M12 4.75c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 1.46 14.97.5 12 .5A11 11 0 0 0 2.18 7.06l3.66 2.84C6.71 6.68 9.14 4.75 12 4.75z"
+            />
+          </svg>
+          Sign in with Google
         </button>
 
         <p class="text-center text-sm text-slate-400">

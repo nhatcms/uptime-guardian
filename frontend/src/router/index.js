@@ -25,6 +25,12 @@ const routes = [
     meta: { public: true },
   },
   {
+    path: '/auth/google/callback',
+    name: 'google-callback',
+    component: () => import('@/views/GoogleCallback.vue'),
+    meta: { public: true },
+  },
+  {
     path: '/dashboard',
     name: 'dashboard',
     component: () => import('@/views/Dashboard.vue'),

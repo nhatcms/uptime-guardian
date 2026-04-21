@@ -94,7 +94,25 @@ class User(Base):
     email: Mapped[Optional[str]] = mapped_column(
         String, nullable=True, unique=True, index=True
     )
-    password_hash: Mapped[str] = mapped_column(String, nullable=False)
+    # Nullable because accounts created purely via Google OAuth have no local
+    # password; password login is simply unavailable for those users until they
+    # set one. Local (form) accounts always carry a bcrypt hash here.
+    password_hash: Mapped[Optional[str]] = mapped_column(
+        String, nullable=True
+    )
+    # --- Google OAuth identity fields -------------------------------------
+    # The Google account's stable subject identifier ("sub" claim). Unique and
+    # nullable: NULL for accounts that have never signed in with Google.
+    google_id: Mapped[Optional[str]] = mapped_column(
+        String, nullable=True, unique=True, index=True
+    )
+    # Profile picture URL provided by Google (or set elsewhere); optional.
+    avatar_url: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    # True once the email has been verified — always true for Google logins
+    # because Google has already verified the address.
+    email_verified: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
     telegram_chat_id: Mapped[Optional[str]] = mapped_column(
         String, nullable=True
     )

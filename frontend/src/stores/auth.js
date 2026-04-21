@@ -117,6 +117,17 @@ export const useAuthStore = defineStore('auth', () => {
     return data
   }
 
+  /**
+   * Establish a session from a token issued out-of-band (e.g. the Google
+   * OAuth callback). Stores the token and hydrates the profile, mirroring
+   * `login` but without a credential round-trip.
+   */
+  async function loginWithToken(token) {
+    setToken(token)
+    await fetchProfile()
+    return token
+  }
+
   /** Clear the held token and profile, logging the user out. */
   function logout() {
     setToken(null)
@@ -137,6 +148,7 @@ export const useAuthStore = defineStore('auth', () => {
     setToken,
     fetchProfile,
     login,
+    loginWithToken,
     register,
     logout,
   }

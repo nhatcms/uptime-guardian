@@ -8,6 +8,11 @@ const baseURL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
 // auth store (implemented in a later task).
 export const TOKEN_STORAGE_KEY = 'uptime_guardian_token'
 
+// Absolute URL of the backend "Sign in with Google" entry point. This is a
+// full top-level browser navigation (not an XHR), so it must be an absolute
+// URL the browser can redirect to; the backend then bounces to Google.
+export const GOOGLE_LOGIN_URL = `${baseURL}/api/auth/google/login`
+
 /**
  * Read the current Auth_Token.
  *

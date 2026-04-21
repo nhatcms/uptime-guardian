@@ -17,6 +17,8 @@ Requirements traceability: 1.3, 1.4, 1.6, 1.7, 8.1, 8.2, 8.3, 8.4, 10.3, 10.4.
 
 from __future__ import annotations
 
+import re
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -372,6 +374,93 @@ def get_user_by_email(db: Session, email: str) -> Optional[User]:
     """Return the user with ``email`` or ``None`` if not found."""
     stmt = select(User).where(User.email == email)
     return db.scalars(stmt).first()
+
+
+def get_user_by_google_id(db: Session, google_id: str) -> Optional[User]:
+    """Return the user whose ``google_id`` matches, or ``None`` if not found."""
+    stmt = select(User).where(User.google_id == google_id)
+    return db.scalars(stmt).first()
+
+
+def _unique_username_from_email(db: Session, email: str) -> str:
+    """Derive a unique username from an email's local part.
+
+    Uses the part before "@" as the base, sanitized to alphanumerics/._-, and
+    appends a numeric suffix when the candidate already exists so the username
+    uniqueness invariant holds for auto-provisioned Google accounts.
+    """
+    base = re.sub(r"[^A-Za-z0-9._-]", "", email.split("@", 1)[0]) or "user"
+    candidate = base
+    suffix = 1
+    while get_user_by_username(db, candidate) is not None:
+        suffix += 1
+        candidate = f"{base}{suffix}"
+    return candidate
+
+
+def create_google_user(
+    db: Session,
+    *,
+    google_id: str,
+    email: str,
+    display_name: Optional[str],
+    avatar_url: Optional[str],
+    plan_id: int,
+) -> User:
+    """Create a Tenant_User provisioned from a Google profile.
+
+    The account is created with ``email_verified=True`` because Google has
+    already verified the address. It is given a random, unusable password hash
+    so password login can never succeed (the user signs in via Google) while
+    still satisfying databases whose ``password_hash`` column predates the
+    nullable change and is still ``NOT NULL``. A username is derived uniquely
+    from the email local part (``display_name`` is accepted for
+    forward-compatibility but the stored username must satisfy the uniqueness
+    constraint). The user starts on the Free Plan (Requirements 2.5, 2.7).
+    """
+    from auth import hash_password  # lazy import to avoid import-order coupling
+
+    username = _unique_username_from_email(db, email)
+    # A random secret nobody holds: bcrypt of 32 random bytes. This keeps the
+    # NOT NULL constraint satisfied on legacy schemas while making password
+    # authentication impossible for a Google-provisioned account.
+    unusable_password_hash = hash_password(secrets.token_urlsafe(32))
+    user = User(
+        username=username,
+        email=email,
+        password_hash=unusable_password_hash,
+        google_id=google_id,
+        avatar_url=avatar_url,
+        email_verified=True,
+        plan_id=plan_id,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def link_google_account(
+    db: Session,
+    user: User,
+    *,
+    google_id: str,
+    avatar_url: Optional[str] = None,
+) -> User:
+    """Attach a Google identity to an existing (manually created) account.
+
+    Sets ``google_id`` and marks the email verified (Google has verified it),
+    backfilling ``avatar_url`` only when the account has none so a manual
+    profile choice is preserved. The existing password is left intact so the
+    user can still log in either way.
+    """
+    user.google_id = google_id
+    user.email_verified = True
+    if avatar_url and not user.avatar_url:
+        user.avatar_url = avatar_url
+    db.commit()
+    db.refresh(user)
+    return user
 
 
 # --- Plan CRUD -------------------------------------------------------------

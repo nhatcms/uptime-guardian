@@ -80,9 +80,36 @@ class Settings(BaseSettings):
     # Base URL of SePay's dynamic VietQR image endpoint.
     sepay_qr_base_url: str = "https://qr.sepay.vn/img"
 
+    # --- Google OAuth 2.0 (Sign in with Google) ---------------------------
+    # OAuth client credentials from the Google Cloud Console
+    # (APIs & Services -> Credentials -> OAuth 2.0 Client ID, type "Web
+    # application"). When either id or secret is empty the Google login routes
+    # respond with 503 so the feature degrades gracefully; never hardcoded.
+    google_client_id: str = ""
+    google_client_secret: str = ""
+    # The redirect/callback URI registered as an "Authorized redirect URI" in
+    # the Google console. Must point at the backend callback route below.
+    google_redirect_uri: str = (
+        "http://localhost:8000/api/auth/google/callback"
+    )
+    # Base URL of the SPA the backend redirects back to after the OAuth dance,
+    # carrying the issued token (or an error code) in the URL.
+    frontend_base_url: str = "http://localhost:5173"
+    # Discovery endpoints (overridable for testing); these are Google's stable
+    # OAuth 2.0 / OpenID Connect endpoints.
+    google_authorize_url: str = (
+        "https://accounts.google.com/o/oauth2/v2/auth"
+    )
+    google_token_url: str = "https://oauth2.googleapis.com/token"
+
     # --- Plan seeding ------------------------------------------------------
     # Name of the default free Plan seeded on first run (Requirement 1.8).
     free_plan_name: str = "Free"
+
+    @property
+    def google_oauth_configured(self) -> bool:
+        """True when both Google client id and secret are present."""
+        return bool(self.google_client_id and self.google_client_secret)
 
     @property
     def cors_origins_list(self) -> list[str]:

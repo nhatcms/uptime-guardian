@@ -47,6 +47,8 @@ def get_settings(
         username=user.username,
         email=user.email,
         is_admin=user.is_admin,
+        avatar_url=user.avatar_url,
+        email_verified=user.email_verified,
         telegram_chat_id=user.telegram_chat_id,
         plan=ActivePlanOut.model_validate(plan),
         monitors_used=used,

@@ -22,13 +22,18 @@ Requirements traceability: 2.5, 2.9, 11.1-11.6, 12.1-12.6.
 
 from __future__ import annotations
 
+from urllib.parse import urlencode
+
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import RedirectResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 import plans
 from auth import create_access_token, hash_password, verify_password
+from config import load_settings
 from database import get_db
+from oauth import google
 from schemas import LoginRequest, RegisterRequest, TokenResponse
 from turnstile import TurnstileResult, verify_token
 
@@ -127,3 +132,123 @@ async def login(
 
     token = create_access_token(subject=user.username)
     return TokenResponse(access_token=token)
+
+
+# ---------------------------------------------------------------------------
+# Google OAuth 2.0 ("Sign in with Google")
+#
+# Two endpoints implement the server-side authorization-code flow:
+#   GET /api/auth/google/login    -> 302 to Google's consent screen
+#   GET /api/auth/google/callback -> handle Google's redirect, then 302 back to
+#                                    the SPA with a token (or an error code) in
+#                                    the URL fragment.
+# The token is placed in the URL *fragment* (#...), which browsers do not send
+# to servers, keeping it out of access logs and Referer headers.
+# ---------------------------------------------------------------------------
+
+
+def _frontend_redirect(**params: str) -> RedirectResponse:
+    """Redirect the browser back to the SPA callback with fragment params."""
+    settings = load_settings()
+    base = settings.frontend_base_url.rstrip("/")
+    fragment = urlencode(params)
+    return RedirectResponse(
+        url=f"{base}/auth/google/callback#{fragment}",
+        status_code=status.HTTP_302_FOUND,
+    )
+
+
+@router.get("/google/login")
+def google_login() -> RedirectResponse:
+    """Redirect the browser to Google's consent screen (Sign in with Google).
+
+    Returns 503 when Google OAuth is not configured so the frontend can hide or
+    disable the button gracefully.
+    """
+    if not google.is_configured():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Google sign-in is not configured",
+        )
+    state = google.create_state()
+    return RedirectResponse(
+        url=google.build_authorization_url(state),
+        status_code=status.HTTP_302_FOUND,
+    )
+
+
+@router.get("/google/callback")
+async def google_callback(
+    db: Session = Depends(get_db),
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+) -> RedirectResponse:
+    """Handle Google's OAuth redirect and sign the user in.
+
+    Account-resolution rules (Requirement: account linking):
+
+    * google_id already known            -> log in.
+    * email exists without a google_id   -> link the Google identity to it,
+      mark the email verified, and signal ``status=linked``. No new account.
+    * email exists with a *different*     -> reject (the address is already
+      google_id                             bound to another Google account).
+    * email is new                        -> create the account with the Google
+      profile, ``email_verified=True``, on the Free Plan.
+
+    On any failure the browser is redirected back to the SPA with a friendly
+    ``error`` code rather than an opaque server error.
+    """
+    # The user declined consent or Google reported an error.
+    if error:
+        return _frontend_redirect(error="access_denied")
+
+    if not code or not google.verify_state(state or ""):
+        # Missing code or a forged/expired state (CSRF protection).
+        return _frontend_redirect(error="invalid_request")
+
+    try:
+        profile = await google.exchange_code_for_profile(code)
+    except google.GoogleOAuthUnavailable:
+        return _frontend_redirect(error="provider_unavailable")
+    except google.GoogleOAuthError:
+        return _frontend_redirect(error="exchange_failed")
+
+    import crud  # lazy import to avoid import-order coupling
+
+    status_flag = "ok"
+
+    user = crud.get_user_by_google_id(db, profile.google_id)
+    if user is None:
+        existing = crud.get_user_by_email(db, profile.email)
+        if existing is not None:
+            if existing.google_id and existing.google_id != profile.google_id:
+                # The email is already linked to a different Google account.
+                return _frontend_redirect(error="account_conflict")
+            # Manually created account: link it instead of creating a new one.
+            user = crud.link_google_account(
+                db,
+                existing,
+                google_id=profile.google_id,
+                avatar_url=profile.avatar_url,
+            )
+            status_flag = "linked"
+        else:
+            # Brand-new user: provision on the Free Plan with verified email.
+            free_plan = plans.get_free_plan(db)
+            try:
+                user = crud.create_google_user(
+                    db,
+                    google_id=profile.google_id,
+                    email=profile.email,
+                    display_name=profile.display_name,
+                    avatar_url=profile.avatar_url,
+                    plan_id=free_plan.id,
+                )
+            except IntegrityError:
+                db.rollback()
+                return _frontend_redirect(error="account_conflict")
+            status_flag = "created"
+
+    token = create_access_token(subject=user.username)
+    return _frontend_redirect(token=token, status=status_flag)

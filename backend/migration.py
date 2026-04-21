@@ -50,6 +50,10 @@ _NEW_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("users", "plan_expires_at", "plan_expires_at DATETIME"),
     ("users", "is_admin", "is_admin BOOLEAN NOT NULL DEFAULT 0"),
     ("users", "created_at", "created_at DATETIME"),
+    # Google OAuth identity columns (Sign in with Google feature).
+    ("users", "google_id", "google_id VARCHAR"),
+    ("users", "avatar_url", "avatar_url VARCHAR"),
+    ("users", "email_verified", "email_verified BOOLEAN NOT NULL DEFAULT 0"),
     ("monitors", "user_id", "user_id INTEGER"),
 )
 
